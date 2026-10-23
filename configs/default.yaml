@@ -1,0 +1,89 @@
+# Multimodal Bottleneck Fusion (RGB + 3-frame motion) — default configuration.
+# Any key can be overridden from the CLI:  --set model.bottleneck_tokens=8 train.batch_size=8
+
+classes: [drone, bird, bug]          # extend freely (e.g. airplane, helicopter); Top-5 needs >5 classes to be meaningful
+
+data:
+  root: data/processed               # unified format, see README "Data format"
+  input_size: 640                    # letterboxed square input; raise to 960 if your targets are very small
+  frame_step_train: 2                # temporal subsampling of training frames
+  frame_step_eval: 1
+  motion:
+    mode: causal                     # causal: frames (t-2, t-1, t)  -> usable online / realtime
+                                     # centered: frames (t-1, t, t+1) -> 1 frame latency, slightly sharper
+    gain: 4.0                        # motion-map contrast multiplier before clipping to [0,1]
+    blur: 3                          # Gaussian blur kernel before differencing (suppresses sensor noise)
+    stabilize: false                 # ORB+homography global-motion compensation (turn on for panning/moving cameras)
+  small_obj_px: 10                   # "small" bucket threshold used for oversampling (input pixels, sqrt(area))
+  small_obj_oversample: 2.0          # frames containing a small target get this sampling weight (1.0 = off)
+  cache_dir: cache                   # frozen-backbone feature cache (scripts/cache_features.py)
+  num_workers: 6
+
+model:
+  backbone: resnet18                 # frozen ImageNet backbone: resnet18 | resnet34 | resnet50 | resnet101
+  pretrained: true
+  dim: 256                           # fusion width d
+  fusion: bottleneck                 # rgb | motion | early | late | joint_attn | bottleneck
+  bottleneck_tokens: 4               # K
+  layers: 2                          # fusion depth (also used by baseline conv stacks for parity)
+  heads: 8
+  joint_attn_pool: 1                 # joint-attention baseline token pooling (1 = same resolution as MBT, the fair
+                                     # comparison; it is quadratic: 2N = 12,800 tokens at 640 px). See variant joint_attn_p2.
+  gate:                              # Johnson-criteria dynamic modality balancing
+    enabled: true
+    johnson_mid_px: 10.4             # midpoint between recognition (4 lp = 8 px) and identification (6.4 lp = 12.8 px)
+    johnson_tau: 2.0                 # softness of the transition (px)
+    floor: 0.1                       # neither modality is ever fully switched off
+    loss_weight: 0.1
+  max_objs: 64
+
+train:
+  batch_size: 16
+  lr: 5.0e-4
+  weight_decay: 0.05
+  warmup_iters: 500
+  epochs: 72
+  save_at: [12, 24, 36, 72]
+  lr_steps: [0.667, 0.889]           # step decays (x0.1) at these fractions of the schedule
+  amp: true
+  grad_clip: 1.0
+  loss: {hm: 1.0, wh: 0.1, "off": 1.0}   # quoted: bare `off` is YAML for false
+  val_max_frames: 2000               # cap on val frames evaluated at each save point (null = all)
+  seed: 0
+
+tier1:                               # curriculum stage 1: detection + motion on small targets
+  zoom_out: [0.4, 1.0]               # random content scale (only without feature cache) pushes targets into <10 px buckets
+  zoom_prob: 0.5
+  hflip_prob: 0.5                    # only without feature cache
+
+tier2:                               # curriculum stage 2: classification on high-resolution crops
+  crop_size: 128
+  context: 1.5                       # crop side = context * max(w, h)
+  min_crop_px: 24                    # minimum crop side in original pixels
+  min_obj_px: 8                      # Johnson recognition threshold (4 line pairs) in ORIGINAL pixels
+  frame_step: 3
+  epochs: 15
+  lr: 1.0e-3
+  batch_size: 128
+  train_fusion: false                # true = also fine-tune necks + fusion (heavier, may hurt detection)
+  label_smoothing: 0.1
+  class_balance: true
+  reclassify_min_px: 8               # at inference, boxes >= this (orig px) are re-classified by the crop head
+
+eval:
+  topk: 100
+  score_thr: 0.01
+  iou: 0.5
+  size_buckets:                      # sqrt(box area) in ORIGINAL pixels
+    tiny: [0, 10]
+    small: [10, 32]
+    medium: [32, 96]
+    large: [96, 100000]
+
+track:
+  det_thr: 0.3
+  max_age: 15
+  min_hits: 3
+  iou_threshold: 0.1
+  match_scale: 2.0                   # boxes are enlarged by this factor for association (tiny, fast targets rarely overlap)
+  trail_len: 32
